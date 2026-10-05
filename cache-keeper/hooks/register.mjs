@@ -45,7 +45,8 @@ const S = {
   rateLimits: [],
 }
 
-const settings = { bigTokens: 150000, guard: true, ttlMin: 0, alerts: true, keepWarmHours: 4 }
+const DEFAULTS = { bigTokens: 150000, guard: true, ttlMin: 0, alerts: true, keepWarmHours: 4, autoCompactTokens: 0 }
+const settings = { ...DEFAULTS }
 const names = { cache: 'cache', keepwarm: 'keepwarm', board: 'board', handoff: 'handoff' }
 
 let now = 0
@@ -57,6 +58,7 @@ let fleet = [] // heartbeats of every session, this one included
 const alerted = new Map() // sessionId -> state or warning key already announced
 let paneOpen = false
 let justCompacted = false
+let autoAsked = 0 // lastActivity the auto-compact question was already asked for
 let handoffPending = false
 
 // The handoff flow. When /session-handoff runs (the band's button, /handoff, a
@@ -407,11 +409,41 @@ function warnStep($) {
   }
 }
 
+// Auto-compact: while the cache is still warm a compaction reads the big context
+// at the cheap cache-read price; after it expires the same compaction pays a full
+// rewrite first. So near the end of the window, on a context over the threshold,
+// ask once whether to compact now. Off by default (/cache autocompact 300k).
+async function autoCompactStep($) {
+  if (!settings.autoCompactTokens || S.keepWarm || S.working || !S.lastActivity) return
+  if (S.ctx < settings.autoCompactTokens || autoAsked === S.lastActivity) return
+  const ttl = ttlMin()
+  const left = msLeft(S.lastActivity, ttl)
+  const lead = ttl >= 60 ? 10 * MIN : 2 * MIN
+  if (left === null || left <= 0 || left > lead) return
+  autoAsked = S.lastActivity
+  let answer = 'Not now'
+  try {
+    answer = await $.ui.ask(
+      `Cache goes cold in ${minutes(left)}. Compacting ${tokens(S.ctx)} tokens now reads them at the cache price; after that it costs about ${money(rewriteCost(S.ctx, S.model, ttl))} to rewrite first. Compact now?`,
+      ['Compact now', 'Not now'],
+    )
+  } catch {
+    return
+  }
+  if (answer !== 'Compact now') return
+  try {
+    await $.session.compact()
+  } catch {
+    $.ui.toast('Auto-compact did not run (a turn was in progress or compaction was refused).', { timeoutMs: 8000 })
+  }
+}
+
 async function tick($) {
   now = await $.clock.now()
   await readRecording($)
   await applyRemoteCommands($)
   await keepWarmStep($)
+  autoCompactStep($).catch(() => {})
   await heartbeat($, true)
   await readFleet($)
   warnStep($)
@@ -435,7 +467,8 @@ function statusText() {
   if (S.rateLimits.length) lines.push(`Plan limits used: ${limitsText(S.rateLimits)}.`)
   lines.push(`Session cost so far: ${money(S.costUsd)}. Cold restarts this session: ${S.coldRestarts.length} (${money(S.coldRestarts.reduce((a, c) => a + c.usd, 0))}).`)
   lines.push(`Cold-send guard: ${settings.guard ? 'on' : 'off'} for contexts over ${tokens(settings.bigTokens)} tokens. Alerts: ${settings.alerts ? 'on' : 'off'}.`)
-  lines.push(`Settings: /${names.cache} ttl 5|60|auto, /${names.cache} guard on|off, /${names.cache} big 150k, /${names.cache} alerts on|off. Board: /${names.board}.`)
+  lines.push(`Auto-compact: ${settings.autoCompactTokens ? `asks near the end of the cache window on contexts over ${tokens(settings.autoCompactTokens)} tokens` : 'off'}.`)
+  lines.push(`Settings: /${names.cache} ttl 5|60|auto, /${names.cache} guard on|off, /${names.cache} big 150k, /${names.cache} alerts on|off, /${names.cache} autocompact 300k|off, /${names.cache} reset (back to defaults). Board: /${names.board}.`)
   return lines.join('\n')
 }
 
@@ -455,7 +488,7 @@ export function register(on) {
     S.model = await $.session.model()
     await loadSettings($)
     await readRecording($)
-    names.cache = (await registerCommand($, 'cache', 'Cache Keeper status and settings', '[ttl 5|60|auto] [guard on|off] [big 150k] [alerts on|off]')) || names.cache
+    names.cache = (await registerCommand($, 'cache', 'Cache Keeper status and settings', '[ttl 5|60|auto] [guard on|off] [big 150k] [alerts on|off] [autocompact 300k|off] [reset]')) || names.cache
     names.keepwarm = (await registerCommand($, 'keepwarm', 'Keep this session\'s prompt cache warm (default 4 hours), or /keepwarm off', '[hours|off]', true)) || names.keepwarm
     names.board = (await registerCommand($, 'board', 'Every local Claude Code session: state, context, cache, cost', '', true)) || names.board
     names.handoff = (await registerCommand($, 'handoff', 'Session handoff, then clear this chat and continue with it (/handoff continue)', '[continue]')) || names.handoff
@@ -660,13 +693,17 @@ export function register(on) {
   on('command.run', { command: ['cache', 'ck-cache'] }, async ($, e) => {
     now = await $.clock.now()
     const [key, value] = String(e.args || '').trim().toLowerCase().split(/\s+/)
-    if (key === 'ttl') {
+    if (key === 'reset') {
+      Object.assign(settings, DEFAULTS)
+    } else if (key === 'ttl') {
       settings.ttlMin = value === '5' ? 5 : value === '60' ? 60 : 0
     } else if (key === 'guard' || key === 'alerts') {
       settings[key] = value !== 'off'
     } else if (key === 'big') {
       const n = parseTokens(value)
       if (n) settings.bigTokens = n
+    } else if (key === 'autocompact') {
+      settings.autoCompactTokens = value === 'off' ? 0 : parseTokens(value) || settings.autoCompactTokens
     }
     if (key) {
       await $.store.set('settings', settings)
