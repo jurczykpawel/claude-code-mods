@@ -764,8 +764,10 @@ export function register(on) {
     parts.push(Text({ dimColor: true, children: [` │ session ${money(S.costUsd)}`] }))
     if (S.coldRestarts.length) parts.push(Text({ dimColor: true, children: [` │ ${S.coldRestarts.length} cold restart${S.coldRestarts.length === 1 ? '' : 's'} ${money(S.coldRestarts.reduce((a, c) => a + c.usd, 0))}`] }))
     const row = [Box({ flexDirection: 'row', children: parts })]
-    if (st.kind === 'cooling' && big) {
-      row.push(Button({ key: 'keepwarm', label: 'keep warm', hotkey: '1', plain: true, onPress: async () => { now = await $.clock.now(); startKeepWarm($, settings.keepWarmHours); await heartbeat($, true); $.ui.invalidate('ui.render') } }))
+    // Offered whenever the cache is still alive (warm or cooling), whatever its size
+    // and however long it has left: a cold cache can't be kept, a ping would rewrite it.
+    if (st.kind === 'warm' || st.kind === 'cooling') {
+      row.push(Button({ key: 'keepwarm', label: `keep warm ${settings.keepWarmHours}h`, hotkey: '1', plain: true, onPress: async () => { now = await $.clock.now(); startKeepWarm($, settings.keepWarmHours); await heartbeat($, true); $.ui.invalidate('ui.render') } }))
     } else if (st.kind === 'kept') {
       row.push(Button({ key: 'keepwarm', label: 'stop warm', hotkey: '1', plain: true, onPress: async () => { now = await $.clock.now(); stopKeepWarm($, 'turned off'); await heartbeat($, true); $.ui.invalidate('ui.render') } }))
     }
