@@ -11,9 +11,11 @@
 import { rewriteCost, requestCost, totalInput, cachedShare, priceFor } from './pricing.mjs'
 import { tokens, usd, minutes, clock, clip, basename, pad } from './fmt.mjs'
 import { makeMasker } from './privacy.mjs'
+import { pingMarginMs, classifyColdRestart, settleKeepWarm, summarize, pruneEvents } from './ledger.mjs'
 
 const MIN = 60000
 const HEARTBEAT_EVERY = 30000
+const LEDGER_DAYS = 30
 const PANE = 'cache-board'
 
 // This session
@@ -29,6 +31,13 @@ const S = {
   ttlMin: 60,
   ttlSource: 'default',
   coldRestarts: [],
+  // The ledger (ledger.mjs): what keep warm cost and saved, what cold restarts cost
+  lastRealAt: 0, // last main-loop request; pings don't count
+  episode: null, // pings since lastRealAt: { lastRealAt, pings, usd }, settled by the next request
+  pingReadTokens: 0, // cached tokens the pings read, for the measured cost per token
+  longestSleepMs: 0, // longest stall of the 30 s timer since lastRealAt (sleep, suspend)
+  pendingResume: false,
+  events: [], // this session id's ledger events, also in $.store as ledger:<id>
   working: false,
   turnId: '', // the main loop's running (or last) turn
   waitingSince: 0,
@@ -58,6 +67,7 @@ let fleet = [] // heartbeats of every session, this one included
 const alerted = new Map() // sessionId -> state or warning key already announced
 let paneOpen = false
 let justCompacted = false
+let lastTickAt = 0
 let autoAsked = 0 // lastActivity the auto-compact question was already asked for
 let handoffPending = false
 
@@ -362,8 +372,7 @@ async function keepWarmStep($) {
   if (now >= S.keepWarmUntil) return stopKeepWarm($, 'time limit reached')
   if (S.working || !S.lastActivity) return
   const ttl = ttlMin()
-  const margin = ttl >= 60 ? 8 * MIN : 90000
-  if (now - S.lastActivity < ttl * MIN - margin) return
+  if (now - S.lastActivity < ttl * MIN - pingMarginMs(ttl)) return
   let reply = null
   try {
     reply = await $.model.fork({ prompt: 'cache-keeper keep-alive ping. Reply with only: ok' })
@@ -376,7 +385,12 @@ async function keepWarmStep($) {
   const u = reply.usage
   S.pings += 1
   S.lastPingAt = now
-  S.pingUsd += requestCost(u, S.model, ttl)
+  const cost = requestCost(u, S.model, ttl)
+  S.pingUsd += cost
+  S.pingReadTokens += u.cache_read_input_tokens || 0
+  if (!S.episode) S.episode = { lastRealAt: S.lastRealAt, pings: 0, usd: 0 }
+  S.episode.pings += 1
+  S.episode.usd += cost
   // A ping that writes instead of reading did not hit the cache: stop paying for it
   if ((u.cache_creation_input_tokens || 0) > 0.1 * Math.max(1, u.cache_read_input_tokens || 0)) {
     return stopKeepWarm($, `the ping wrote ${tokens(u.cache_creation_input_tokens)} tokens instead of reading the cache`)
@@ -438,8 +452,79 @@ async function autoCompactStep($) {
   }
 }
 
+// Ledger events go to this session's own store key, so sessions never overwrite
+// each other; anything older than LEDGER_DAYS is dropped on the way.
+async function recordEvent($, ev) {
+  S.events = pruneEvents([...S.events, ev], now - LEDGER_DAYS * 24 * 60 * MIN)
+  try {
+    if (S.id) await $.store.set('ledger:' + S.id, S.events)
+  } catch {
+    // the store refused: keep the event in memory, never fail the request it rides on
+  }
+}
+
+// Pings nobody came back for (the chat closed or cleared first) were spent for nothing
+async function abandonEpisode($) {
+  if (!S.episode) return
+  const ep = S.episode
+  S.episode = null
+  await recordEvent($, { at: now, kind: 'keepwarm', outcome: 'abandoned', pings: ep.pings, pingUsd: ep.usd, savedUsd: 0 })
+}
+
+async function readLedger($) {
+  const cutoff = now - LEDGER_DAYS * 24 * 60 * MIN
+  const all = []
+  for (const k of (await $.store.keys()).filter((key) => key.startsWith('ledger:'))) {
+    const list = k === 'ledger:' + S.id ? S.events : await $.store.get(k)
+    const kept = pruneEvents(Array.isArray(list) ? list : [], cutoff)
+    if (!kept.length && k !== 'ledger:' + S.id) await $.store.delete(k)
+    all.push(...kept)
+  }
+  return all
+}
+
+const COLD_LABELS = {
+  avoidable: 'avoidable with keep warm',
+  'not-worth': 'keep warm would have cost more',
+  asleep: 'computer asleep or Claude Code suspended',
+  'too-long': 'idle over 24 h',
+  'keepwarm-failed': 'keep warm was on and missed',
+}
+
+function ledgerLines(title, s) {
+  const k = s.keepWarm
+  const c = s.cold
+  const lines = [`${title}:`]
+  lines.push(`  Keep warm: ${k.pings} ping(s), spent ${money(k.pingUsd)}; saved ${money(k.savedUsd)} on ${k.saved} return(s) that would have been cold; net ${money(k.netUsd)}.`)
+  if (k.unneeded + k.failed + k.abandoned) lines.push(`    Pings spent for nothing ${money(k.wastedUsd)}: ${k.unneeded} unneeded (cache was still warm), ${k.failed} missed, ${k.abandoned} never came back.`)
+  lines.push(`  Cold restarts: ${c.count}, spent ${money(c.usd)}; keep warm could have saved ${money(c.avoidableUsd)} of it.`)
+  for (const [cat, v] of Object.entries(c.byCategory)) {
+    lines.push(`    ${COLD_LABELS[cat] || cat}: ${v.count}, ${money(v.usd)}${v.avoidableUsd ? `, saving ${money(v.avoidableUsd)}` : ''}`)
+  }
+  if (s.resume.count) lines.push(`  Resumed chats: ${s.resume.count}, spent ${money(s.resume.usd)} rewriting the cache (the chat was closed, nothing could keep it warm).`)
+  return lines
+}
+
+async function statsText($) {
+  const all = await readLedger($)
+  const day = 24 * 60 * MIN
+  const lines = [
+    ...ledgerLines('This chat', summarize(S.events)),
+    ...ledgerLines('Last 7 days, all chats', summarize(all, now - 7 * day)),
+    ...ledgerLines('Last 30 days, all chats', summarize(all, now - 30 * day)),
+  ]
+  if (S.episode) lines.push(`Open keep-warm stretch: ${S.episode.pings} ping(s), ${money(S.episode.usd)}, settled by your next message.`)
+  lines.push('Prices are API list prices; on a subscription they are usage against your plan limits. Contexts under 30k tokens are not counted.')
+  return lines.join('\n')
+}
+
 async function tick($) {
   now = await $.clock.now()
+  // The 30 s timer stalls while the machine sleeps or the process is suspended
+  if (lastTickAt && now - lastTickAt > 3 * HEARTBEAT_EVERY) {
+    S.longestSleepMs = Math.max(S.longestSleepMs, now - lastTickAt - HEARTBEAT_EVERY)
+  }
+  lastTickAt = now
   await readRecording($)
   await applyRemoteCommands($)
   await keepWarmStep($)
@@ -466,9 +551,11 @@ function statusText() {
   if (S.keepWarm) lines.push(`Keep warm is on until ${clock(S.keepWarmUntil)}: ${S.pings} ping(s), ${money(S.pingUsd)} so far.`)
   if (S.rateLimits.length) lines.push(`Plan limits used: ${limitsText(S.rateLimits)}.`)
   lines.push(`Session cost so far: ${money(S.costUsd)}. Cold restarts this session: ${S.coldRestarts.length} (${money(S.coldRestarts.reduce((a, c) => a + c.usd, 0))}).`)
+  const led = summarize(S.events)
+  lines.push(`Ledger, this chat: keep warm net ${money(led.keepWarm.netUsd)} (spent ${money(led.keepWarm.pingUsd)}, saved ${money(led.keepWarm.savedUsd)}); cold restarts ${money(led.cold.usd)}, of which avoidable ${money(led.cold.avoidableUsd)}. Details: /${names.cache} stats.`)
   lines.push(`Cold-send guard: ${settings.guard ? 'on' : 'off'} for contexts over ${tokens(settings.bigTokens)} tokens. Alerts: ${settings.alerts ? 'on' : 'off'}.`)
   lines.push(`Auto-compact: ${settings.autoCompactTokens ? `asks near the end of the cache window on contexts over ${tokens(settings.autoCompactTokens)} tokens` : 'off'}.`)
-  lines.push(`Settings: /${names.cache} ttl 5|60|auto, /${names.cache} guard on|off, /${names.cache} big 150k, /${names.cache} alerts on|off, /${names.cache} autocompact 300k|off, /${names.cache} reset (back to defaults). Board: /${names.board}.`)
+  lines.push(`Settings: /${names.cache} ttl 5|60|auto, /${names.cache} guard on|off, /${names.cache} big 150k, /${names.cache} alerts on|off, /${names.cache} autocompact 300k|off, /${names.cache} reset (back to defaults), /${names.cache} stats (what keep warm and cold restarts cost). Board: /${names.board}.`)
   return lines.join('\n')
 }
 
@@ -488,7 +575,9 @@ export function register(on) {
     S.model = await $.session.model()
     await loadSettings($)
     await readRecording($)
-    names.cache = (await registerCommand($, 'cache', 'Cache Keeper status and settings', '[ttl 5|60|auto] [guard on|off] [big 150k] [alerts on|off] [autocompact 300k|off] [reset]')) || names.cache
+    const saved = await $.store.get('ledger:' + S.id)
+    S.events = Array.isArray(saved) ? saved : []
+    names.cache = (await registerCommand($, 'cache', 'Cache Keeper status and settings', '[ttl 5|60|auto] [guard on|off] [big 150k] [alerts on|off] [autocompact 300k|off] [reset] [stats]')) || names.cache
     names.keepwarm = (await registerCommand($, 'keepwarm', 'Keep this session\'s prompt cache warm (default 4 hours), or /keepwarm off', '[hours|off]', true)) || names.keepwarm
     names.board = (await registerCommand($, 'board', 'Every local Claude Code session: state, context, cache, cost', '', true)) || names.board
     names.handoff = (await registerCommand($, 'handoff', 'Session handoff, then clear this chat and continue with it (/handoff continue)', '[continue]')) || names.handoff
@@ -500,7 +589,12 @@ export function register(on) {
   // /clear, /resume and /branch start from an unknown cache. The process goes
   // on under a new session id, and no session.start fires for it.
   on('classic.SessionStart', { source: ['clear', 'resume', 'fork'] }, async ($, e, next) => {
+    now = await $.clock.now()
+    await abandonEpisode($)
     S.lastActivity = 0
+    S.lastRealAt = 0
+    S.longestSleepMs = 0
+    S.pendingResume = e.source === 'resume'
     S.keepWarm = false
     H.armed = false
     try {
@@ -509,10 +603,14 @@ export function register(on) {
       // keep the old id
     }
     S.label = basename(S.cwd)
+    const saved = await $.store.get('ledger:' + S.id)
+    S.events = Array.isArray(saved) ? saved : []
     return next(e)
   })
 
   on('session.end', async ($, e, next) => {
+    now = await $.clock.now()
+    await abandonEpisode($)
     if (S.id) await $.store.delete('hb:' + S.id)
     return next(e)
   })
@@ -579,6 +677,22 @@ export function register(on) {
     S.model = u.model || S.model
     const afterCompact = justCompacted
     justCompacted = false
+    const realGap = S.lastRealAt ? startedAt - S.lastRealAt : 0
+    // Settle the keep-warm stretch this request ends
+    let keepWarmMissed = false
+    if (S.episode && afterCompact) {
+      await abandonEpisode($)
+    } else if (S.episode) {
+      const settled = settleKeepWarm({ episode: S.episode, startedAt, ttlMin: ttlMin(), usage: u, model: S.model })
+      S.episode = null
+      keepWarmMissed = settled.outcome === 'failed'
+      await recordEvent($, { at: now, kind: 'keepwarm', ...settled })
+    }
+    // The first request of a resumed chat rewrites a cache nobody could keep warm
+    if (S.pendingResume && !afterCompact && total > 30000 && written / total > 0.5) {
+      await recordEvent($, { at: now, kind: 'resume', tokens: written, usd: rewriteCost(written, S.model, ttlMin()) })
+    }
+    S.pendingResume = false
     if (afterCompact) {
       // the first request after a compaction writes the new, shorter context: expected
     } else if (S.lastActivity && total > 30000 && written / total > 0.5) {
@@ -588,6 +702,17 @@ export function register(on) {
         S.ttlSource = 'measured'
       }
       S.coldRestarts.push({ at: now, tokens: written, usd: rewriteCost(written, S.model, ttlMin()), gapMin: Math.round(gap / MIN) })
+      const measured = S.pingReadTokens ? { usd: S.pingUsd, readTokens: S.pingReadTokens } : undefined
+      const c = classifyColdRestart({
+        gapMs: realGap || gap,
+        ttlMin: ttlMin(),
+        tokens: written,
+        model: S.model,
+        keepWarmOn: S.keepWarm || keepWarmMissed,
+        longestSleepMs: S.longestSleepMs,
+        measured,
+      })
+      await recordEvent($, { at: now, kind: 'cold', category: c.category, tokens: written, usd: c.usd, avoidableUsd: c.avoidableUsd, pingsNeeded: c.pingsNeeded, gapMin: Math.round((realGap || gap) / MIN) })
     } else if (S.lastActivity && total > 30000 && gap > 5.5 * MIN && cachedShare(u) > 0.8) {
       // A hit after more than 5 idle minutes proves the 1-hour TTL
       if (!settings.ttlMin) {
@@ -597,6 +722,8 @@ export function register(on) {
     }
     S.ctx = total
     S.lastActivity = now
+    S.lastRealAt = now
+    S.longestSleepMs = 0
     return result
   })
 
@@ -693,6 +820,7 @@ export function register(on) {
   on('command.run', { command: ['cache', 'ck-cache'] }, async ($, e) => {
     now = await $.clock.now()
     const [key, value] = String(e.args || '').trim().toLowerCase().split(/\s+/)
+    if (key === 'stats') return { text: await statsText($) }
     if (key === 'reset') {
       Object.assign(settings, DEFAULTS)
     } else if (key === 'ttl') {
