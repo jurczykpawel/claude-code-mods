@@ -571,9 +571,9 @@ function compactAdvice(warm, sendPending = false) {
 
 // One notice when compacting starts to pay, and again only after the context doubled. Not in the bar: the figures are on demand in /cache compact.
 function compactNoticeStep($) {
-  if (!settings.alerts || S.working || !S.lastActivity || S.keepWarm) return
+  if (!settings.alerts || S.working || !S.lastActivity) return
   const st = cacheState(myHeartbeat())
-  if (st.kind !== 'warm' && st.kind !== 'cooling') return
+  if (st.kind !== 'warm' && st.kind !== 'cooling' && st.kind !== 'kept') return
   if (S.advisedCtx && S.ctx < S.advisedCtx * 2) return
   const a = compactAdvice(true)
   if (!a || a.verdict !== 'compact') return
