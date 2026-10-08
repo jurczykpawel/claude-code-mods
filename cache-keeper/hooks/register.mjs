@@ -12,6 +12,7 @@ import { rewriteCost, requestCost, totalInput, cachedShare, priceFor } from './p
 import { tokens, usd, minutes, clock, clip, basename, pad } from './fmt.mjs'
 import { makeMasker } from './privacy.mjs'
 import { pingMarginMs, classifyColdRestart, settleKeepWarm, summarize, pruneEvents } from './ledger.mjs'
+import { DEFAULT_PARAMS, advise, calibrate, gapShare, stepsPerTurn } from './compact.mjs'
 
 const MIN = 60000
 const HEARTBEAT_EVERY = 30000
@@ -37,6 +38,10 @@ const S = {
   pingReadTokens: 0, // cached tokens the pings read, for the measured cost per token
   longestSleepMs: 0, // longest stall of the 30 s timer since lastRealAt (sleep, suspend)
   pendingResume: false,
+  turns: 0, // messages this session: the base of the gap share and requests per message
+  steps: 0, // model requests of the main loop
+  longGaps: 0, // messages that arrived after a gap longer than the cache TTL
+  advisedCtx: 0, // context size the 'worth compacting' notice was last shown for
   events: [], // this session id's ledger events, also in $.store as ledger:<id>
   working: false,
   turnId: '', // the main loop's running (or last) turn
@@ -54,7 +59,7 @@ const S = {
   rateLimits: [],
 }
 
-const DEFAULTS = { bigTokens: 150000, guard: true, ttlMin: 0, alerts: true, keepWarmHours: 4, autoCompactTokens: 0 }
+const DEFAULTS = { bigTokens: 150000, guard: true, ttlMin: 0, alerts: true, keepWarmHours: 4, autoCompactTokens: 0, horizonTurns: DEFAULT_PARAMS.horizonTurns }
 const settings = { ...DEFAULTS }
 const names = { cache: 'cache', keepwarm: 'keepwarm', board: 'board', handoff: 'handoff' }
 
@@ -68,6 +73,8 @@ const alerted = new Map() // sessionId -> state or warning key already announced
 let paneOpen = false
 let justCompacted = false
 let lastTickAt = 0
+let compactCache = null // { at, params, sources }: what advise() runs on, refreshed every few minutes
+const COMPACT_REFRESH = 10 * MIN
 let autoAsked = 0 // lastActivity the auto-compact question was already asked for
 let handoffPending = false
 
@@ -518,8 +525,96 @@ async function statsText($) {
   return lines.join('\n')
 }
 
+// Per-session counters for the compaction advice: messages, requests, long gaps
+async function saveUsage($) {
+  try {
+    if (S.id) await $.store.set('usage:' + S.id, { at: now, turns: S.turns, steps: S.steps, longGaps: S.longGaps })
+  } catch {
+    // the store refused: the counters stay in memory
+  }
+}
+
+async function readUsageTotals($) {
+  const cutoff = now - LEDGER_DAYS * 24 * 60 * MIN
+  const total = { turns: S.turns, steps: S.steps, longGaps: S.longGaps }
+  for (const k of (await $.store.keys()).filter((key) => key.startsWith('usage:'))) {
+    if (k === 'usage:' + S.id) continue
+    const u = await $.store.get(k)
+    if (!u || typeof u !== 'object' || (u.at || 0) < cutoff) {
+      await $.store.delete(k)
+      continue
+    }
+    total.turns += u.turns || 0
+    total.steps += u.steps || 0
+    total.longGaps += u.longGaps || 0
+  }
+  return total
+}
+
+// What advise() runs on: defaults, replaced by what this machine measured
+async function refreshCompactParams($) {
+  const usage = await readUsageTotals($)
+  const cal = calibrate(await readLedger($), DEFAULT_PARAMS)
+  const gap = gapShare(usage, DEFAULT_PARAMS.gapShare)
+  compactCache = {
+    at: now,
+    usage,
+    params: { ...cal.params, gapShare: gap.value, stepsPerTurn: stepsPerTurn(usage, DEFAULT_PARAMS.stepsPerTurn), horizonTurns: settings.horizonTurns },
+    sources: { ...cal.sources, gapShare: gap.source, stepsPerTurn: usage.turns >= 30 ? 'measured' : 'default' },
+  }
+}
+
+function compactAdvice(warm, sendPending = false) {
+  if (!compactCache || !S.model) return null
+  return advise({ ctx: S.ctx, model: S.model, ttlMin: ttlMin(), params: { ...compactCache.params, horizonTurns: settings.horizonTurns }, warm, sendPending, keepWarmOn: S.keepWarm })
+}
+
+// One notice when compacting starts to pay, and again only after the context doubled. Not in the bar: the figures are on demand in /cache compact.
+function compactNoticeStep($) {
+  if (!settings.alerts || S.working || !S.lastActivity || S.keepWarm) return
+  const st = cacheState(myHeartbeat())
+  if (st.kind !== 'warm' && st.kind !== 'cooling') return
+  if (S.advisedCtx && S.ctx < S.advisedCtx * 2) return
+  const a = compactAdvice(true)
+  if (!a || a.verdict !== 'compact') return
+  S.advisedCtx = S.ctx
+  $.ui.toast(`Worth compacting now: ${tokens(S.ctx)} tokens. It costs about ${money(a.costUsd)} and pays back in about ${Math.max(1, Math.round(a.breakEvenTurns))} message(s). Details: /${names.cache} compact.`, { timeoutMs: 15000 })
+}
+
+const SOURCE = { default: 'assumed', measured: 'measured' }
+
+function compactText() {
+  if (!compactCache) return 'Not enough data yet: try again in a moment.'
+  if (!S.ctx || !S.model) return 'No request yet in this chat, so there is nothing to compact.'
+  const { params, sources, usage } = compactCache
+  const ttl = ttlMin()
+  const st = cacheState(myHeartbeat())
+  const warm = st.kind === 'warm' || st.kind === 'cooling' || st.kind === 'kept'
+  const a = compactAdvice(warm, !warm)
+  const pct = (v) => Math.round(v * 100) + '%'
+  const lines = []
+  const verdict = {
+    compact: `Worth compacting now.`,
+    wait: `Not yet: it would not pay back within ${params.horizonTurns} messages.`,
+    'too-small': `Not worth it: the chat is barely bigger than what a compaction leaves (${tokens(params.newCtxTokens)}).`,
+  }[a.verdict]
+  lines.push(`Compacting this chat (${tokens(S.ctx)} tokens): ${verdict}`)
+  lines.push(`  Cost ${money(a.costUsd)} ${warm ? '(cache warm: it reads the chat at the cache price)' : '(cache cold and your next message rewrites it anyway: only the summary and the new prefix are extra)'}.`)
+  lines.push(`  Saves about ${money(a.savingPerTurnUsd)} per message; pays back after about ${Number.isFinite(a.breakEvenTurns) ? Math.max(1, Math.round(a.breakEvenTurns)) : 'never'} message(s). You said ${params.horizonTurns} are coming (/${names.cache} horizon N).`)
+  if (Number.isFinite(a.breakEvenCtx)) lines.push(`  At ${params.horizonTurns} messages it pays from about ${tokens(Math.round(a.breakEvenCtx))} tokens up.`)
+  if (warm && Number.isFinite(a.idleReturnThreshold) && a.idleReturnThreshold <= 1) {
+    lines.push(`  If you step away, compacting before the cache expires beats letting it expire when you come back with probability above ${pct(a.idleReturnThreshold)}.`)
+  }
+  lines.push(`Behind the figures (${SOURCE[sources.newCtxTokens]} = from defaults, measured = from your own compactions here):`)
+  lines.push(`  After a compaction the next request carries ${tokens(Math.round(params.newCtxTokens))} tokens (${SOURCE[sources.newCtxTokens]}), ${pct(params.rewriteShare)} of it written (${SOURCE[sources.rewriteShare]}), summary ${tokens(Math.round(params.summaryTokens))} tokens (${SOURCE[sources.summaryTokens]}).`)
+  lines.push(`  ${params.stepsPerTurn.toFixed(1)} model requests per message (${SOURCE[sources.stepsPerTurn]}), ${pct(params.gapShare)} of messages after a gap over ${ttl} min (${SOURCE[sources.gapShare]}${usage.turns ? `, ${usage.turns} messages seen` : ''}).`)
+  lines.push('Money only: a summary loses detail, and this does not price that.')
+  return lines.join('\n')
+}
+
 async function tick($) {
   now = await $.clock.now()
+  if (!compactCache || now - compactCache.at > COMPACT_REFRESH) await refreshCompactParams($).catch(() => {})
   // The 30 s timer stalls while the machine sleeps or the process is suspended
   if (lastTickAt && now - lastTickAt > 3 * HEARTBEAT_EVERY) {
     S.longestSleepMs = Math.max(S.longestSleepMs, now - lastTickAt - HEARTBEAT_EVERY)
@@ -532,6 +627,7 @@ async function tick($) {
   await heartbeat($, true)
   await readFleet($)
   warnStep($)
+  compactNoticeStep($)
   $.ui.invalidate('ui.render')
 }
 
@@ -555,7 +651,7 @@ function statusText() {
   lines.push(`Ledger, this chat: keep warm net ${money(led.keepWarm.netUsd)} (spent ${money(led.keepWarm.pingUsd)}, saved ${money(led.keepWarm.savedUsd)}); cold restarts ${money(led.cold.usd)}, of which avoidable ${money(led.cold.avoidableUsd)}. Details: /${names.cache} stats.`)
   lines.push(`Cold-send guard: ${settings.guard ? 'on' : 'off'} for contexts over ${tokens(settings.bigTokens)} tokens. Alerts: ${settings.alerts ? 'on' : 'off'}.`)
   lines.push(`Auto-compact: ${settings.autoCompactTokens ? `asks near the end of the cache window on contexts over ${tokens(settings.autoCompactTokens)} tokens` : 'off'}.`)
-  lines.push(`Settings: /${names.cache} ttl 5|60|auto, /${names.cache} guard on|off, /${names.cache} big 150k, /${names.cache} alerts on|off, /${names.cache} autocompact 300k|off, /${names.cache} reset (back to defaults), /${names.cache} stats (what keep warm and cold restarts cost). Board: /${names.board}.`)
+  lines.push(`Settings: /${names.cache} ttl 5|60|auto, /${names.cache} guard on|off, /${names.cache} big 150k, /${names.cache} alerts on|off, /${names.cache} autocompact 300k|off, /${names.cache} reset (back to defaults), /${names.cache} stats (what keep warm and cold restarts cost), /${names.cache} compact (is compacting worth it now), /${names.cache} horizon 15 (messages you expect to send). Board: /${names.board}.`)
   return lines.join('\n')
 }
 
@@ -577,7 +673,7 @@ export function register(on) {
     await readRecording($)
     const saved = await $.store.get('ledger:' + S.id)
     S.events = Array.isArray(saved) ? saved : []
-    names.cache = (await registerCommand($, 'cache', 'Cache Keeper status and settings', '[ttl 5|60|auto] [guard on|off] [big 150k] [alerts on|off] [autocompact 300k|off] [reset] [stats]')) || names.cache
+    names.cache = (await registerCommand($, 'cache', 'Cache Keeper status and settings', '[ttl 5|60|auto] [guard on|off] [big 150k] [alerts on|off] [autocompact 300k|off] [reset] [stats] [compact] [horizon 15]')) || names.cache
     names.keepwarm = (await registerCommand($, 'keepwarm', 'Keep this session\'s prompt cache warm (default 4 hours), or /keepwarm off', '[hours|off]', true)) || names.keepwarm
     names.board = (await registerCommand($, 'board', 'Every local Claude Code session: state, context, cache, cost', '', true)) || names.board
     names.handoff = (await registerCommand($, 'handoff', 'Session handoff, then clear this chat and continue with it (/handoff continue)', '[continue]')) || names.handoff
@@ -659,6 +755,10 @@ export function register(on) {
   on('turn.start', async ($, e, next) => {
     now = await $.clock.now()
     S.working = true
+    if (!e.agentId) {
+      S.turns += 1
+      if (S.lastRealAt && now - S.lastRealAt > ttlMin() * MIN) S.longGaps += 1
+    }
     if (e.turnId) S.turnId = e.turnId
     await heartbeat($, true)
     return next(e)
@@ -670,6 +770,7 @@ export function register(on) {
     const result = yield* next(e)
     if (e.agentId || !result || !result.usage) return result
     now = await $.clock.now()
+    S.steps += 1
     const u = result.usage
     const total = totalInput(u)
     const written = u.cache_creation_input_tokens || 0
@@ -694,7 +795,10 @@ export function register(on) {
     }
     S.pendingResume = false
     if (afterCompact) {
-      // the first request after a compaction writes the new, shorter context: expected
+      // The first request after a compaction writes the new, shorter context: expected.
+      // Its size and write share are what the next compaction's cost is calibrated on.
+      if (total > 0) await recordEvent($, { at: now, kind: 'compact-rebuild', written, total })
+      S.advisedCtx = 0
     } else if (S.lastActivity && total > 30000 && written / total > 0.5) {
       // A rewrite after 5-60 idle minutes means this session runs on the 5-minute TTL
       if (!settings.ttlMin && gap > 5.5 * MIN && gap < S.ttlMin * MIN) {
@@ -735,6 +839,7 @@ export function register(on) {
     S.waitingSince = 0
     S.tool = ''
     S.lastTurnEnd = now
+    await saveUsage($)
     try {
       const usage = await $.session.usage()
       if (usage.context && usage.context.tokens) S.ctx = usage.context.tokens
@@ -751,8 +856,24 @@ export function register(on) {
   })
 
   on('session.compact', async ($, e, next) => {
+    now = await $.clock.now()
+    const before = cacheState(myHeartbeat())
     const r = await next(e)
+    if (e.trigger === 'precompute' || e.agentId || !r || r.skip) return r
     justCompacted = true
+    const u = r.usage
+    await recordEvent($, {
+      at: now,
+      kind: 'compact',
+      trigger: e.trigger,
+      before: r.tokensBefore || S.ctx,
+      after: r.tokensAfter || 0,
+      outputTokens: u ? u.output_tokens || 0 : 0,
+      readTokens: u ? u.cache_read_input_tokens || 0 : 0,
+      wroteTokens: u ? u.cache_creation_input_tokens || 0 : 0,
+      usd: u ? requestCost(u, S.model, ttlMin()) : 0,
+      warm: before.kind === 'warm' || before.kind === 'cooling' || before.kind === 'kept',
+    })
     return r
   })
 
@@ -821,6 +942,10 @@ export function register(on) {
     now = await $.clock.now()
     const [key, value] = String(e.args || '').trim().toLowerCase().split(/\s+/)
     if (key === 'stats') return { text: await statsText($) }
+    if (key === 'compact') {
+      await refreshCompactParams($)
+      return { text: compactText() }
+    }
     if (key === 'reset') {
       Object.assign(settings, DEFAULTS)
     } else if (key === 'ttl') {
@@ -830,6 +955,12 @@ export function register(on) {
     } else if (key === 'big') {
       const n = parseTokens(value)
       if (n) settings.bigTokens = n
+    } else if (key === 'horizon') {
+      const n = Math.round(Number(value))
+      if (n > 0) {
+        settings.horizonTurns = Math.min(500, n)
+        S.advisedCtx = 0
+      }
     } else if (key === 'autocompact') {
       settings.autoCompactTokens = value === 'off' ? 0 : parseTokens(value) || settings.autoCompactTokens
     }
