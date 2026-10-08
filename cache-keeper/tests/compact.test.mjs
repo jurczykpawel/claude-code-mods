@@ -14,6 +14,8 @@ import {
   calibrate,
   gapShare,
   stepsPerTurn,
+  horizonFrom,
+  adviceSummary,
 } from '../hooks/compact.mjs'
 
 const MODEL = 'claude-opus-5-5'
@@ -200,4 +202,50 @@ test('break-even context with 12 requests per message and a 15 message horizon',
 test('steps per message: no history gives the prior, history shrinks toward it', () => {
   assert.equal(stepsPerTurn({ turns: 0, steps: 0 }, 12), 12)
   close(stepsPerTurn({ turns: 40, steps: 800 }, 12), (800 + 10 * 12) / (40 + 10))
+})
+
+// A notice's outcome is written when the session ends (or is cleared): how many
+// messages were still to come after the notice, and whether the owner compacted.
+const adv = (remaining, compacted = false, compactedAfter = null) => ({ kind: 'advice', remaining, compacted, compactedAfter })
+
+test('horizon: fewer than 3 notices seen keeps the prior and says so', () => {
+  const h = horizonFrom([adv(30), adv(10)], 15)
+  assert.equal(h.value, 15)
+  assert.equal(h.source, 'default')
+})
+
+test('horizon: the median of messages that were left after each notice', () => {
+  const h = horizonFrom([adv(30), adv(10), adv(50), adv(4)], 15)
+  assert.equal(h.value, 20) // median of 4, 10, 30, 50
+  assert.equal(h.source, 'measured')
+})
+
+test('horizon: ignores other events and notices without a count, never below 1', () => {
+  const events = [{ kind: 'cold', usd: 1 }, adv(0), adv(0), adv(0), { kind: 'advice', compacted: true }]
+  const h = horizonFrom(events, 15)
+  assert.equal(h.value, 1)
+  assert.equal(h.source, 'measured')
+})
+
+test('advice summary: how often notices led to a compaction, and how fast', () => {
+  const events = [adv(40, true, 2), adv(25, true, 6), adv(12, false), adv(60, false), { kind: 'cold', usd: 1 }]
+  const a = adviceSummary(events)
+  assert.equal(a.shown, 4)
+  assert.equal(a.acted, 2)
+  assert.equal(a.actedShare, 0.5)
+  assert.equal(a.medianRemaining, 32.5)
+  assert.equal(a.medianMessagesToAct, 4)
+})
+
+test('advice summary: nothing shown yet', () => {
+  const a = adviceSummary([{ kind: 'cold', usd: 1 }])
+  assert.equal(a.shown, 0)
+  assert.equal(a.actedShare, 0)
+  assert.equal(a.medianRemaining, null)
+  assert.equal(a.medianMessagesToAct, null)
+})
+
+test('advice summary respects the time window', () => {
+  const events = [{ ...adv(10, true, 1), at: 100 }, { ...adv(10, false), at: 5 }]
+  assert.equal(adviceSummary(events, 50).shown, 1)
 })

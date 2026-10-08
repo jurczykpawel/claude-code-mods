@@ -12,7 +12,7 @@ import { rewriteCost, requestCost, totalInput, cachedShare, priceFor } from './p
 import { tokens, usd, minutes, clock, clip, basename, pad } from './fmt.mjs'
 import { makeMasker } from './privacy.mjs'
 import { pingMarginMs, classifyColdRestart, settleKeepWarm, summarize, pruneEvents } from './ledger.mjs'
-import { DEFAULT_PARAMS, advise, calibrate, gapShare, stepsPerTurn } from './compact.mjs'
+import { DEFAULT_PARAMS, advise, calibrate, gapShare, stepsPerTurn, horizonFrom, adviceSummary } from './compact.mjs'
 
 const MIN = 60000
 const HEARTBEAT_EVERY = 30000
@@ -42,6 +42,9 @@ const S = {
   steps: 0, // model requests of the main loop
   longGaps: 0, // messages that arrived after a gap longer than the cache TTL
   advisedCtx: 0, // context size the 'worth compacting' notice was last shown for
+  adviceTurns: null, // S.turns at this session's first notice; the outcome is written when the session ends
+  adviceCtx: 0,
+  adviceCompactedAfter: null, // messages between that notice and the first compaction after it
   events: [], // this session id's ledger events, also in $.store as ledger:<id>
   working: false,
   turnId: '', // the main loop's running (or last) turn
@@ -59,7 +62,7 @@ const S = {
   rateLimits: [],
 }
 
-const DEFAULTS = { bigTokens: 150000, guard: true, ttlMin: 0, alerts: true, keepWarmHours: 4, autoCompactTokens: 0, horizonTurns: DEFAULT_PARAMS.horizonTurns }
+const DEFAULTS = { bigTokens: 150000, guard: true, ttlMin: 0, alerts: true, keepWarmHours: 4, autoCompactTokens: 0, horizonTurns: 0 } // horizonTurns 0 = learn it from notices
 const settings = { ...DEFAULTS }
 const names = { cache: 'cache', keepwarm: 'keepwarm', board: 'board', handoff: 'handoff' }
 
@@ -521,6 +524,8 @@ async function statsText($) {
     ...ledgerLines('Last 30 days, all chats', summarize(all, now - 30 * day)),
   ]
   if (S.episode) lines.push(`Open keep-warm stretch: ${S.episode.pings} ping(s), ${money(S.episode.usd)}, settled by your next message.`)
+  const adv = adviceSummary(all, now - 30 * day)
+  if (adv.shown) lines.push(`Compaction notices, last 30 days: ${adv.shown} shown, you compacted after ${adv.acted} (${Math.round(adv.actedShare * 100)}%); about ${Math.round(adv.medianRemaining)} message(s) were left after a notice.`)
   lines.push('Prices are API list prices; on a subscription they are usage against your plan limits. Contexts under 30k tokens are not counted.')
   return lines.join('\n')
 }
@@ -551,22 +556,36 @@ async function readUsageTotals($) {
   return total
 }
 
+// A notice's outcome, written when its session ends or is cleared: how many
+// messages were still to come, and whether (and how soon) the owner compacted.
+async function flushAdvice($) {
+  if (S.adviceTurns === null) return
+  const compacted = S.adviceCompactedAfter !== null
+  const ev = { at: now, kind: 'advice', ctx: S.adviceCtx, remaining: Math.max(0, S.turns - S.adviceTurns), compacted, compactedAfter: S.adviceCompactedAfter }
+  S.adviceTurns = null
+  S.adviceCompactedAfter = null
+  await recordEvent($, ev)
+}
+
 // What advise() runs on: defaults, replaced by what this machine measured
 async function refreshCompactParams($) {
   const usage = await readUsageTotals($)
-  const cal = calibrate(await readLedger($), DEFAULT_PARAMS)
+  const ledger = await readLedger($)
+  const cal = calibrate(ledger, DEFAULT_PARAMS)
+  const horizon = horizonFrom(ledger, DEFAULT_PARAMS.horizonTurns)
   const gap = gapShare(usage, DEFAULT_PARAMS.gapShare)
   compactCache = {
     at: now,
     usage,
-    params: { ...cal.params, gapShare: gap.value, stepsPerTurn: stepsPerTurn(usage, DEFAULT_PARAMS.stepsPerTurn), horizonTurns: settings.horizonTurns },
-    sources: { ...cal.sources, gapShare: gap.source, stepsPerTurn: usage.turns >= 30 ? 'measured' : 'default' },
+    ledger,
+    params: { ...cal.params, gapShare: gap.value, stepsPerTurn: stepsPerTurn(usage, DEFAULT_PARAMS.stepsPerTurn), horizonTurns: settings.horizonTurns > 0 ? settings.horizonTurns : horizon.value },
+    sources: { ...cal.sources, gapShare: gap.source, stepsPerTurn: usage.turns >= 30 ? 'measured' : 'default', horizonTurns: settings.horizonTurns > 0 ? 'set' : horizon.source },
   }
 }
 
 function compactAdvice(warm, sendPending = false) {
   if (!compactCache || !S.model) return null
-  return advise({ ctx: S.ctx, model: S.model, ttlMin: ttlMin(), params: { ...compactCache.params, horizonTurns: settings.horizonTurns }, warm, sendPending, keepWarmOn: S.keepWarm })
+  return advise({ ctx: S.ctx, model: S.model, ttlMin: ttlMin(), params: compactCache.params, warm, sendPending, keepWarmOn: S.keepWarm })
 }
 
 // One notice when compacting starts to pay, and again only after the context doubled. Not in the bar: the figures are on demand in /cache compact.
@@ -578,10 +597,16 @@ function compactNoticeStep($) {
   const a = compactAdvice(true)
   if (!a || a.verdict !== 'compact') return
   S.advisedCtx = S.ctx
+  if (S.adviceTurns === null) {
+    S.adviceTurns = S.turns
+    S.adviceCtx = S.ctx
+    S.adviceCompactedAfter = null
+  }
   $.ui.toast(`Worth compacting now: ${tokens(S.ctx)} tokens. It costs about ${money(a.costUsd)} and pays back in about ${Math.max(1, Math.round(a.breakEvenTurns))} message(s). Details: /${names.cache} compact.`, { timeoutMs: 15000 })
 }
 
 const SOURCE = { default: 'assumed', measured: 'measured' }
+const HORIZON_SOURCE = { default: 'assumed', measured: 'median of the messages that were left after your earlier notices', set: 'set by you' }
 
 function compactText() {
   if (!compactCache) return 'Not enough data yet: try again in a moment.'
@@ -600,7 +625,7 @@ function compactText() {
   }[a.verdict]
   lines.push(`Compacting this chat (${tokens(S.ctx)} tokens): ${verdict}`)
   lines.push(`  Cost ${money(a.costUsd)} ${warm ? '(cache warm: it reads the chat at the cache price)' : '(cache cold and your next message rewrites it anyway: only the summary and the new prefix are extra)'}.`)
-  lines.push(`  Saves about ${money(a.savingPerTurnUsd)} per message; pays back after about ${Number.isFinite(a.breakEvenTurns) ? Math.max(1, Math.round(a.breakEvenTurns)) : 'never'} message(s). You said ${params.horizonTurns} are coming (/${names.cache} horizon N).`)
+  lines.push(`  Saves about ${money(a.savingPerTurnUsd)} per message; pays back after about ${Number.isFinite(a.breakEvenTurns) ? Math.max(1, Math.round(a.breakEvenTurns)) : 'never'} message(s). Horizon: ${params.horizonTurns} message(s) still to come (${HORIZON_SOURCE[sources.horizonTurns]}; /${names.cache} horizon N|auto).`)
   if (Number.isFinite(a.breakEvenCtx)) lines.push(`  At ${params.horizonTurns} messages it pays from about ${tokens(Math.round(a.breakEvenCtx))} tokens up.`)
   if (warm && Number.isFinite(a.idleReturnThreshold) && a.idleReturnThreshold <= 1) {
     lines.push(`  If you step away, compacting before the cache expires beats letting it expire when you come back with probability above ${pct(a.idleReturnThreshold)}.`)
@@ -608,6 +633,8 @@ function compactText() {
   lines.push(`Behind the figures (${SOURCE[sources.newCtxTokens]} = from defaults, measured = from your own compactions here):`)
   lines.push(`  After a compaction the next request carries ${tokens(Math.round(params.newCtxTokens))} tokens (${SOURCE[sources.newCtxTokens]}), ${pct(params.rewriteShare)} of it written (${SOURCE[sources.rewriteShare]}), summary ${tokens(Math.round(params.summaryTokens))} tokens (${SOURCE[sources.summaryTokens]}).`)
   lines.push(`  ${params.stepsPerTurn.toFixed(1)} model requests per message (${SOURCE[sources.stepsPerTurn]}), ${pct(params.gapShare)} of messages after a gap over ${ttl} min (${SOURCE[sources.gapShare]}${usage.turns ? `, ${usage.turns} messages seen` : ''}).`)
+  const adv = adviceSummary(compactCache.ledger || [])
+  if (adv.shown) lines.push(`Earlier notices: ${adv.shown}, you compacted after ${adv.acted} of them${adv.medianMessagesToAct !== null ? ` (usually ${Math.round(adv.medianMessagesToAct)} message(s) later)` : ''}; about ${Math.round(adv.medianRemaining)} message(s) were left after a notice.`)
   lines.push('Money only: a summary loses detail, and this does not price that.')
   return lines.join('\n')
 }
@@ -687,6 +714,7 @@ export function register(on) {
   on('classic.SessionStart', { source: ['clear', 'resume', 'fork'] }, async ($, e, next) => {
     now = await $.clock.now()
     await abandonEpisode($)
+    await flushAdvice($)
     S.lastActivity = 0
     S.lastRealAt = 0
     S.longestSleepMs = 0
@@ -707,6 +735,7 @@ export function register(on) {
   on('session.end', async ($, e, next) => {
     now = await $.clock.now()
     await abandonEpisode($)
+    await flushAdvice($)
     if (S.id) await $.store.delete('hb:' + S.id)
     return next(e)
   })
@@ -861,6 +890,7 @@ export function register(on) {
     const r = await next(e)
     if (e.trigger === 'precompute' || e.agentId || !r || r.skip) return r
     justCompacted = true
+    if (S.adviceTurns !== null && S.adviceCompactedAfter === null) S.adviceCompactedAfter = Math.max(0, S.turns - S.adviceTurns)
     const u = r.usage
     await recordEvent($, {
       at: now,
@@ -957,10 +987,10 @@ export function register(on) {
       if (n) settings.bigTokens = n
     } else if (key === 'horizon') {
       const n = Math.round(Number(value))
-      if (n > 0) {
-        settings.horizonTurns = Math.min(500, n)
-        S.advisedCtx = 0
-      }
+      if (value === 'auto') settings.horizonTurns = 0
+      else if (n > 0) settings.horizonTurns = Math.min(500, n)
+      S.advisedCtx = 0
+      if (compactCache) compactCache.at = 0 // recompute with the new horizon
     } else if (key === 'autocompact') {
       settings.autoCompactTokens = value === 'off' ? 0 : parseTokens(value) || settings.autoCompactTokens
     }

@@ -154,3 +154,27 @@ export function gapShare({ turns, longGaps }, prior = DEFAULT_PARAMS.gapShare) {
 export function stepsPerTurn({ turns, steps }, prior = DEFAULT_PARAMS.stepsPerTurn) {
   return (steps + STEPS_PRIOR_WEIGHT * prior) / (turns + STEPS_PRIOR_WEIGHT)
 }
+
+// The horizon is the messages still to come once compacting is worth a look. Each
+// 'advice' event is one notice's outcome: `remaining` messages from the notice to
+// the end of that session, so a compaction that carried on afterwards doesn't cut
+// it short. Median once 3 are known, else the prior.
+export function horizonFrom(events, prior = DEFAULT_PARAMS.horizonTurns) {
+  const left = events.filter((e) => e.kind === 'advice' && Number.isFinite(e.remaining)).map((e) => e.remaining)
+  if (left.length < MEASURED_MIN) return { value: prior, source: 'default' }
+  return { value: Math.max(1, Math.round(median(left))), source: 'measured' }
+}
+
+// What came of the notices: how many, how often they led to a compaction, how
+// many messages later, how many messages were left.
+export function adviceSummary(events, since = 0) {
+  const adv = events.filter((e) => e.kind === 'advice' && (e.at === undefined || e.at >= since))
+  const acted = adv.filter((e) => e.compacted)
+  return {
+    shown: adv.length,
+    acted: acted.length,
+    actedShare: adv.length ? acted.length / adv.length : 0,
+    medianRemaining: median(adv.map((e) => e.remaining)),
+    medianMessagesToAct: median(acted.map((e) => e.compactedAfter)),
+  }
+}
