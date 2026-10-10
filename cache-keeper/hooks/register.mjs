@@ -12,6 +12,7 @@ import { rewriteCost, requestCost, totalInput, cachedShare, priceFor } from './p
 import { tokens, usd, minutes, clock, clip, basename, pad } from './fmt.mjs'
 import { makeMasker } from './privacy.mjs'
 import { pingMarginMs, classifyColdRestart, settleKeepWarm, summarize, pruneEvents } from './ledger.mjs'
+import { shouldBlockCompact, summarizeIdleBlocks } from './idleguard.mjs'
 import { DEFAULT_PARAMS, advise, calibrate, gapShare, stepsPerTurn, horizonFrom, adviceSummary } from './compact.mjs'
 
 const MIN = 60000
@@ -62,7 +63,7 @@ const S = {
   rateLimits: [],
 }
 
-const DEFAULTS = { bigTokens: 150000, guard: true, ttlMin: 0, alerts: true, keepWarmHours: 4, autoCompactTokens: 0, horizonTurns: 0 } // horizonTurns 0 = learn it from notices
+const DEFAULTS = { bigTokens: 150000, guard: true, ttlMin: 0, alerts: true, keepWarmHours: 4, autoCompactTokens: 0, horizonTurns: 0, idleGuard: true } // horizonTurns 0 = learn it from notices
 const settings = { ...DEFAULTS }
 const names = { cache: 'cache', keepwarm: 'keepwarm', board: 'board', handoff: 'handoff' }
 
@@ -526,6 +527,9 @@ async function statsText($) {
   if (S.episode) lines.push(`Open keep-warm stretch: ${S.episode.pings} ping(s), ${money(S.episode.usd)}, settled by your next message.`)
   const adv = adviceSummary(all, now - 30 * day)
   if (adv.shown) lines.push(`Compaction notices, last 30 days: ${adv.shown} shown, you compacted after ${adv.acted} (${Math.round(adv.actedShare * 100)}%); about ${Math.round(adv.medianRemaining)} message(s) were left after a notice.`)
+  const ig = summarizeIdleBlocks(all, now - 30 * day)
+  if (ig.blocked || ig.passed) lines.push(`Idle-compaction guard, last 30 days: blocked ${ig.blocked}${ig.lastBlockedAt ? ` (last ${minutes(now - ig.lastBlockedAt)} ago)` : ''}; automatic compactions let through with keep warm on: ${ig.passed}.`)
+  else lines.push('Idle-compaction guard, last 30 days: nothing to block yet (no automatic compaction while keep warm was on).')
   lines.push('Prices are API list prices; on a subscription they are usage against your plan limits. Contexts under 30k tokens are not counted.')
   return lines.join('\n')
 }
@@ -677,6 +681,7 @@ function statusText() {
   const led = summarize(S.events)
   lines.push(`Ledger, this chat: keep warm net ${money(led.keepWarm.netUsd)} (spent ${money(led.keepWarm.pingUsd)}, saved ${money(led.keepWarm.savedUsd)}); cold restarts ${money(led.cold.usd)}, of which avoidable ${money(led.cold.avoidableUsd)}. Details: /${names.cache} stats.`)
   lines.push(`Cold-send guard: ${settings.guard ? 'on' : 'off'} for contexts over ${tokens(settings.bigTokens)} tokens. Alerts: ${settings.alerts ? 'on' : 'off'}.`)
+  lines.push(`Idle-compaction guard: ${settings.idleGuard ? 'on (blocks Claude Code\'s own idle compaction while keep warm is on)' : 'off'}. /cache idleguard on|off.`)
   lines.push(`Auto-compact: ${settings.autoCompactTokens ? `asks near the end of the cache window on contexts over ${tokens(settings.autoCompactTokens)} tokens` : 'off'}.`)
   lines.push(`Settings: /${names.cache} ttl 5|60|auto, /${names.cache} guard on|off, /${names.cache} big 150k, /${names.cache} alerts on|off, /${names.cache} autocompact 300k|off, /${names.cache} reset (back to defaults), /${names.cache} stats (what keep warm and cold restarts cost), /${names.cache} compact (is compacting worth it now), /${names.cache} horizon 15 (messages you expect to send). Board: /${names.board}.`)
   return lines.join('\n')
@@ -886,6 +891,18 @@ export function register(on) {
 
   on('session.compact', async ($, e, next) => {
     now = await $.clock.now()
+    if (e.trigger !== 'precompute' && !e.agentId) {
+      const silentMs = S.lastRealAt ? now - S.lastRealAt : 0
+      const d = shouldBlockCompact({ trigger: e.trigger, keepWarmOn: S.keepWarm, working: S.working, silentMs, enabled: settings.idleGuard })
+      if (d.block || (e.trigger === 'auto' && S.keepWarm)) {
+        const silentMin = Math.round(silentMs / MIN)
+        await recordEvent($, { at: now, kind: 'idle-compact', outcome: d.block ? 'blocked' : 'passed', trigger: e.trigger, silentMin, ctx: S.ctx })
+        if (d.block) {
+          $.ui.toast(`Blocked Claude Code's idle compaction: keep warm is on and nobody wrote for ${silentMin} min. /cache stats shows the log.`, { timeoutMs: 10000 })
+          return { skip: true }
+        }
+      }
+    }
     const before = cacheState(myHeartbeat())
     const r = await next(e)
     if (e.trigger === 'precompute' || e.agentId || !r || r.skip) return r
@@ -991,6 +1008,8 @@ export function register(on) {
       else if (n > 0) settings.horizonTurns = Math.min(500, n)
       S.advisedCtx = 0
       if (compactCache) compactCache.at = 0 // recompute with the new horizon
+    } else if (key === 'idleguard') {
+      settings.idleGuard = value !== 'off'
     } else if (key === 'autocompact') {
       settings.autoCompactTokens = value === 'off' ? 0 : parseTokens(value) || settings.autoCompactTokens
     }
