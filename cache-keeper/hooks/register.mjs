@@ -531,7 +531,7 @@ async function statsText($) {
   const adv = adviceSummary(all, now - 30 * day)
   if (adv.shown) lines.push(`Compaction notices, last 30 days: ${adv.shown} shown, you compacted after ${adv.acted} (${Math.round(adv.actedShare * 100)}%); about ${Math.round(adv.medianRemaining)} message(s) were left after a notice.`)
   const ig = summarizeIdleBlocks(all, now - 30 * day)
-  if (ig.blocked || ig.passed || ig.overridden) lines.push(`Idle-compaction guard, last 30 days: blocked ${ig.blocked} (compacted anyway: ${ig.overridden})${ig.lastBlockedAt ? ` (last ${minutes(now - ig.lastBlockedAt)} ago)` : ''}; automatic compactions let through with keep warm on: ${ig.passed}.`)
+  if (ig.blocked || ig.passed || ig.overridden || ig.legacy) lines.push(`Idle-compaction guard, last 30 days: blocked ${ig.blocked} (compacted anyway: ${ig.overridden})${ig.lastBlockedAt ? ` (last ${minutes(now - ig.lastBlockedAt)} ago)` : ''}; automatic compactions let through with keep warm on: ${ig.passed}.${ig.legacy ? ` Not counted: ${ig.legacy} older record(s) from versions before 1.3.2, which did not block anything.` : ''}`)
   else lines.push('Idle-compaction guard, last 30 days: nothing to block yet (no automatic compaction while keep warm was on).')
   lines.push('Prices are API list prices; on a subscription they are usage against your plan limits. Contexts under 30k tokens are not counted.')
   return lines.join('\n')
@@ -899,7 +899,7 @@ export function register(on) {
       const d = shouldBlockCompact({ trigger: e.trigger, keepWarmOn: S.keepWarm, working: S.working, silentMs, enabled: settings.idleGuard })
       if (d.block || (e.trigger === 'auto' && S.keepWarm)) {
         const silentMin = Math.round(silentMs / MIN)
-        await recordEvent($, { at: now, kind: 'idle-compact', outcome: d.block ? 'blocked' : 'passed', trigger: e.trigger, silentMin, ctx: S.ctx })
+        await recordEvent($, { at: now, kind: 'idle-compact', v: VERSION, outcome: d.block ? 'blocked' : 'passed', trigger: e.trigger, silentMin, ctx: S.ctx })
         if (d.block) {
           $.ui.toast(`Blocked Claude Code's idle compaction: keep warm is on and nobody wrote for ${silentMin} min. /cache stats shows the log.`, { timeoutMs: 10000 })
           lastBlock = { at: now, ctx: S.ctx }
@@ -934,7 +934,7 @@ export function register(on) {
       if (lastBlock && blockOverridden(lastBlock, await $.clock.now(), S.ctx)) {
         const b = lastBlock
         lastBlock = null
-        await recordEvent($, { at: await $.clock.now(), kind: 'idle-compact', outcome: 'overridden', trigger: 'auto', silentMin: 0, ctx: b.ctx })
+        await recordEvent($, { at: await $.clock.now(), kind: 'idle-compact', v: VERSION, outcome: 'overridden', trigger: 'auto', silentMin: 0, ctx: b.ctx })
         $.ui.toast('Claude Code compacted anyway: the block did not hold. See /cache stats.', { timeoutMs: 10000 })
       }
     }

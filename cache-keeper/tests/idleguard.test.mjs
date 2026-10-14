@@ -38,16 +38,16 @@ test('the silence threshold is under the built-in idle moment (~54 min) and over
 
 test('summary counts blocked and passed compactions in the window, and the last one', () => {
   const ev = [
-    { at: 1000, kind: 'idle-compact', outcome: 'blocked', silentMin: 54, ctx: 387000 },
-    { at: 2000, kind: 'idle-compact', outcome: 'blocked', silentMin: 55, ctx: 390000 },
-    { at: 3000, kind: 'idle-compact', outcome: 'passed', silentMin: 4, ctx: 200000 },
+    { at: 1000, kind: 'idle-compact', v: '1.3.4', outcome: 'blocked', silentMin: 54, ctx: 387000 },
+    { at: 2000, kind: 'idle-compact', v: '1.3.4', outcome: 'blocked', silentMin: 55, ctx: 390000 },
+    { at: 3000, kind: 'idle-compact', v: '1.3.4', outcome: 'passed', silentMin: 4, ctx: 200000 },
     { at: 3500, kind: 'cold' },
   ]
   const s = summarizeIdleBlocks(ev, 1500)
   assert.equal(s.blocked, 1)
   assert.equal(s.passed, 1)
   assert.equal(s.lastBlockedAt, 2000)
-  assert.deepEqual(summarizeIdleBlocks([], 0), { blocked: 0, passed: 0, overridden: 0, lastBlockedAt: 0 })
+  assert.deepEqual(summarizeIdleBlocks([], 0), { blocked: 0, passed: 0, overridden: 0, legacy: 0, lastBlockedAt: 0 })
 })
 
 // Claude Code rejects a session.compact result whose skip is not a non-empty
@@ -71,8 +71,23 @@ test('a block counts as overridden when the context collapsed shortly after it',
 
 test('summary also counts overridden blocks', () => {
   const ev = [
-    { at: 1000, kind: 'idle-compact', outcome: 'blocked', ctx: 1 },
-    { at: 2000, kind: 'idle-compact', outcome: 'overridden', ctx: 1 },
+    { at: 1000, kind: 'idle-compact', v: '1.3.4', outcome: 'blocked', ctx: 1 },
+    { at: 2000, kind: 'idle-compact', v: '1.3.4', outcome: 'overridden', ctx: 1 },
   ]
   assert.equal(summarizeIdleBlocks(ev, 0).overridden, 1)
+})
+
+// Before 1.3.2 the veto was rejected by Claude Code, so those "blocked" records
+// are not blocks. New records carry `v`; records without it are counted apart.
+test('records without a version are legacy and do not count as blocks', () => {
+  const ev = [
+    { at: 1000, kind: 'idle-compact', outcome: 'blocked', ctx: 1 },
+    { at: 2000, kind: 'idle-compact', outcome: 'blocked', ctx: 1, v: '1.3.3' },
+    { at: 3000, kind: 'idle-compact', outcome: 'passed', ctx: 1 },
+  ]
+  const s = summarizeIdleBlocks(ev, 0)
+  assert.equal(s.legacy, 2)
+  assert.equal(s.blocked, 1)
+  assert.equal(s.passed, 0)
+  assert.equal(s.lastBlockedAt, 2000)
 })

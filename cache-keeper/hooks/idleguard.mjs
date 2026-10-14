@@ -16,9 +16,13 @@ export function shouldBlockCompact({ trigger, keepWarmOn, working, silentMs, ena
 }
 
 export function summarizeIdleBlocks(events, since = 0) {
-  const s = { blocked: 0, passed: 0, overridden: 0, lastBlockedAt: 0 }
+  const s = { blocked: 0, passed: 0, overridden: 0, legacy: 0, lastBlockedAt: 0 }
   for (const ev of events) {
     if (ev.kind !== 'idle-compact' || ev.at < since) continue
+    if (!ev.v) {
+      s.legacy += 1 // written before 1.3.2, when the veto was rejected
+      continue
+    }
     if (ev.outcome === 'blocked') {
       s.blocked += 1
       s.lastBlockedAt = Math.max(s.lastBlockedAt, ev.at)
