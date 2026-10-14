@@ -12,6 +12,7 @@ import { rewriteCost, requestCost, totalInput, cachedShare, priceFor } from './p
 import { tokens, usd, minutes, clock, clip, basename, pad } from './fmt.mjs'
 import { makeMasker } from './privacy.mjs'
 import { pingMarginMs, classifyColdRestart, settleKeepWarm, summarize, pruneEvents } from './ledger.mjs'
+import { VERSION } from './version.mjs'
 import { shouldBlockCompact, summarizeIdleBlocks, vetoResult, blockOverridden } from './idleguard.mjs'
 import { DEFAULT_PARAMS, advise, calibrate, gapShare, stepsPerTurn, horizonFrom, adviceSummary } from './compact.mjs'
 
@@ -521,6 +522,7 @@ async function statsText($) {
   const all = await readLedger($)
   const day = 24 * 60 * MIN
   const lines = [
+    `Cache Keeper ${VERSION} (the version this chat loaded; chats started before an update keep the old one).`,
     ...ledgerLines('This chat', summarize(S.events)),
     ...ledgerLines('Last 7 days, all chats', summarize(all, now - 7 * day)),
     ...ledgerLines('Last 30 days, all chats', summarize(all, now - 30 * day)),
