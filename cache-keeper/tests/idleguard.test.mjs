@@ -1,7 +1,7 @@
 // Run: node --test cache-keeper/tests/
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { shouldBlockCompact, summarizeIdleBlocks, IDLE_SILENCE_MS } from '../hooks/idleguard.mjs'
+import { shouldBlockCompact, summarizeIdleBlocks, vetoResult, blockOverridden, IDLE_SILENCE_MS } from '../hooks/idleguard.mjs'
 
 const MIN = 60000
 const base = { trigger: 'auto', keepWarmOn: true, working: false, silentMs: 54 * MIN, enabled: true }
@@ -47,5 +47,32 @@ test('summary counts blocked and passed compactions in the window, and the last 
   assert.equal(s.blocked, 1)
   assert.equal(s.passed, 1)
   assert.equal(s.lastBlockedAt, 2000)
-  assert.deepEqual(summarizeIdleBlocks([], 0), { blocked: 0, passed: 0, lastBlockedAt: 0 })
+  assert.deepEqual(summarizeIdleBlocks([], 0), { blocked: 0, passed: 0, overridden: 0, lastBlockedAt: 0 })
+})
+
+// Claude Code rejects a session.compact result whose skip is not a non-empty
+// string ("a skip that is not a reason") and then compacts anyway; found by
+// reading the 2.1.296 binary after 9 of 9 blocks were followed by a compaction.
+test('the veto carries its reason as a non-empty string, which Claude Code requires', () => {
+  const d = shouldBlockCompact(base)
+  const veto = vetoResult(d)
+  assert.equal(typeof veto.skip, 'string')
+  assert.ok(veto.skip.length > 0)
+  assert.notEqual(veto.skip, 'true')
+})
+
+test('a block counts as overridden when the context collapsed shortly after it', () => {
+  const blocked = { at: 1000, ctx: 260000 }
+  assert.equal(blockOverridden(blocked, 1000 + 60000, 20000), true)
+  assert.equal(blockOverridden(blocked, 1000 + 60000, 259000), false)
+  assert.equal(blockOverridden(blocked, 1000 + 20 * MIN, 20000), false) // too late to blame the block
+  assert.equal(blockOverridden(null, 5000, 20000), false)
+})
+
+test('summary also counts overridden blocks', () => {
+  const ev = [
+    { at: 1000, kind: 'idle-compact', outcome: 'blocked', ctx: 1 },
+    { at: 2000, kind: 'idle-compact', outcome: 'overridden', ctx: 1 },
+  ]
+  assert.equal(summarizeIdleBlocks(ev, 0).overridden, 1)
 })
