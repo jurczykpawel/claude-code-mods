@@ -13,6 +13,7 @@ import { tokens, usd, minutes, clock, clip, basename, pad } from './fmt.mjs'
 import { makeMasker } from './privacy.mjs'
 import { pingMarginMs, classifyColdRestart, settleKeepWarm, summarize, pruneEvents } from './ledger.mjs'
 import { VERSION } from './version.mjs'
+import { endCompactDue } from './endcompact.mjs'
 import { shouldBlockCompact, summarizeIdleBlocks, vetoResult, blockOverridden } from './idleguard.mjs'
 import { DEFAULT_PARAMS, advise, calibrate, gapShare, stepsPerTurn, horizonFrom, adviceSummary } from './compact.mjs'
 
@@ -64,7 +65,7 @@ const S = {
   rateLimits: [],
 }
 
-const DEFAULTS = { bigTokens: 150000, guard: true, ttlMin: 0, alerts: true, keepWarmHours: 4, autoCompactTokens: 0, horizonTurns: 0, idleGuard: true } // horizonTurns 0 = learn it from notices
+const DEFAULTS = { bigTokens: 150000, guard: true, ttlMin: 0, alerts: true, keepWarmHours: 4, autoCompactTokens: 0, horizonTurns: 0, idleGuard: true, endCompactTokens: 200000 } // horizonTurns 0 = learn it from notices
 const settings = { ...DEFAULTS }
 const names = { cache: 'cache', keepwarm: 'keepwarm', board: 'board', handoff: 'handoff' }
 
@@ -77,6 +78,7 @@ let fleet = [] // heartbeats of every session, this one included
 const alerted = new Map() // sessionId -> state or warning key already announced
 let paneOpen = false
 let justCompacted = false
+let selfCompacting = false // our own compaction: the idle guard must let it through
 let lastBlock = null // { at, ctx } of the last idle compaction we vetoed
 let lastTickAt = 0
 let compactCache = null // { at, params, sources }: what advise() runs on, refreshed every few minutes
@@ -380,12 +382,47 @@ function stopKeepWarm($, why) {
   $.ui.toast(`Keep warm off (${why}). ${S.pings} ping(s), ${money(S.pingUsd)}.`, { timeoutMs: 8000 })
 }
 
+// The last ping would be followed by an expired cache and a full-price rewrite of
+// a big context: compact now, while the cache is warm, and stop pinging.
+async function compactInsteadOfLastPing($) {
+  const due = endCompactDue({
+    keepWarmOn: S.keepWarm,
+    working: S.working,
+    ttlMin: ttlMin(),
+    ctx: S.ctx,
+    threshold: settings.endCompactTokens,
+    lastActivity: S.lastActivity,
+    now,
+    keepWarmUntil: S.keepWarmUntil,
+    silentMs: S.lastRealAt ? now - S.lastRealAt : 0,
+  })
+  if (!due) return false
+  const ctx = S.ctx
+  selfCompacting = true
+  try {
+    await $.session.compact()
+  } catch (err) {
+    await recordEvent($, { at: now, kind: 'end-compact', v: VERSION, outcome: 'failed', ctx, why: String((err && err.message) || err).slice(0, 120) })
+    $.ui.toast('Keep warm could not compact before its time limit; pinging instead.', { timeoutMs: 8000 })
+    return false
+  } finally {
+    selfCompacting = false
+  }
+  await recordEvent($, { at: now, kind: 'end-compact', v: VERSION, outcome: 'compacted', ctx })
+  stopKeepWarm($, `compacted ${tokens(ctx)} tokens before the time limit`)
+  return true
+}
+
 async function keepWarmStep($) {
   if (!S.keepWarm) return
-  if (now >= S.keepWarmUntil) return stopKeepWarm($, 'time limit reached')
+  if (now >= S.keepWarmUntil) {
+    if (await compactInsteadOfLastPing($)) return
+    return stopKeepWarm($, 'time limit reached')
+  }
   if (S.working || !S.lastActivity) return
   const ttl = ttlMin()
   if (now - S.lastActivity < ttl * MIN - pingMarginMs(ttl)) return
+  if (await compactInsteadOfLastPing($)) return
   let reply = null
   try {
     reply = await $.model.fork({ prompt: 'cache-keeper keep-alive ping. Reply with only: ok' })
@@ -533,6 +570,8 @@ async function statsText($) {
   const ig = summarizeIdleBlocks(all, now - 30 * day)
   if (ig.blocked || ig.passed || ig.overridden || ig.legacy) lines.push(`Idle-compaction guard, last 30 days: blocked ${ig.blocked} (compacted anyway: ${ig.overridden})${ig.lastBlockedAt ? ` (last ${minutes(now - ig.lastBlockedAt)} ago)` : ''}; automatic compactions let through with keep warm on: ${ig.passed}.${ig.legacy ? ` Not counted: ${ig.legacy} older record(s) from versions before 1.3.2, which did not block anything.` : ''}`)
   else lines.push('Idle-compaction guard, last 30 days: nothing to block yet (no automatic compaction while keep warm was on).')
+  const ec = all.filter((ev) => ev.kind === 'end-compact' && ev.at >= now - 30 * day)
+  if (ec.length) lines.push(`Compacted before keep warm ended, last 30 days: ${ec.filter((ev) => ev.outcome === 'compacted').length} of ${ec.length} attempt(s), contexts ${ec.map((ev) => tokens(ev.ctx)).join(', ')}.`)
   lines.push('Prices are API list prices; on a subscription they are usage against your plan limits. Contexts under 30k tokens are not counted.')
   return lines.join('\n')
 }
@@ -685,6 +724,7 @@ function statusText() {
   lines.push(`Ledger, this chat: keep warm net ${money(led.keepWarm.netUsd)} (spent ${money(led.keepWarm.pingUsd)}, saved ${money(led.keepWarm.savedUsd)}); cold restarts ${money(led.cold.usd)}, of which avoidable ${money(led.cold.avoidableUsd)}. Details: /${names.cache} stats.`)
   lines.push(`Cold-send guard: ${settings.guard ? 'on' : 'off'} for contexts over ${tokens(settings.bigTokens)} tokens. Alerts: ${settings.alerts ? 'on' : 'off'}.`)
   lines.push(`Idle-compaction guard: ${settings.idleGuard ? 'on (blocks Claude Code\'s own idle compaction while keep warm is on)' : 'off'}. /cache idleguard on|off.`)
+  lines.push(`Compact before keep warm ends: ${settings.endCompactTokens ? `on for contexts over ${tokens(settings.endCompactTokens)} tokens, when nobody wrote for 30 min and the last ping is due` : 'off'}. /cache endcompact 200k|off.`)
   lines.push(`Auto-compact: ${settings.autoCompactTokens ? `asks near the end of the cache window on contexts over ${tokens(settings.autoCompactTokens)} tokens` : 'off'}.`)
   lines.push(`Settings: /${names.cache} ttl 5|60|auto, /${names.cache} guard on|off, /${names.cache} big 150k, /${names.cache} alerts on|off, /${names.cache} autocompact 300k|off, /${names.cache} reset (back to defaults), /${names.cache} stats (what keep warm and cold restarts cost), /${names.cache} compact (is compacting worth it now), /${names.cache} horizon 15 (messages you expect to send). Board: /${names.board}.`)
   return lines.join('\n')
@@ -894,7 +934,7 @@ export function register(on) {
 
   on('session.compact', async ($, e, next) => {
     now = await $.clock.now()
-    if (e.trigger !== 'precompute' && !e.agentId) {
+    if (e.trigger !== 'precompute' && !e.agentId && !selfCompacting) {
       const silentMs = S.lastRealAt ? now - S.lastRealAt : 0
       const d = shouldBlockCompact({ trigger: e.trigger, keepWarmOn: S.keepWarm, working: S.working, silentMs, enabled: settings.idleGuard })
       if (d.block || (e.trigger === 'auto' && S.keepWarm)) {
@@ -1020,6 +1060,8 @@ export function register(on) {
       else if (n > 0) settings.horizonTurns = Math.min(500, n)
       S.advisedCtx = 0
       if (compactCache) compactCache.at = 0 // recompute with the new horizon
+    } else if (key === 'endcompact') {
+      settings.endCompactTokens = value === 'off' ? 0 : parseTokens(value) || settings.endCompactTokens
     } else if (key === 'idleguard') {
       settings.idleGuard = value !== 'off'
     } else if (key === 'autocompact') {
