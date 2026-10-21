@@ -752,7 +752,7 @@ export function register(on) {
     const saved = await $.store.get('ledger:' + S.id)
     S.events = Array.isArray(saved) ? saved : []
     names.cache = (await registerCommand($, 'cache', 'Cache Keeper status and settings', '[ttl 5|60|auto] [guard on|off] [big 150k] [alerts on|off] [autocompact 300k|off] [reset] [stats] [compact] [horizon 15]')) || names.cache
-    names.keepwarm = (await registerCommand($, 'keepwarm', 'Keep this session\'s prompt cache warm (default 12 hours; each message restarts the clock), or /keepwarm off', '[hours|off]', true)) || names.keepwarm
+    names.keepwarm = (await registerCommand($, 'keepwarm', 'Keep the prompt cache warm while you are away. Stops after N hours (default 12, max 24) with no message from you; off to stop now', '[hours|off]', true)) || names.keepwarm
     names.board = (await registerCommand($, 'board', 'Every local Claude Code session: state, context, cache, cost', '', true)) || names.board
     names.handoff = (await registerCommand($, 'handoff', 'Session handoff, then clear this chat and continue with it (/handoff continue)', '[continue]')) || names.handoff
     $.clock.every(HEARTBEAT_EVERY, () => tick($).catch(() => {}))
