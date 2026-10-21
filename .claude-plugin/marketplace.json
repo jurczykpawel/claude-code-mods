@@ -1,5 +1,5 @@
 {
-  "name": "jurczykpawel-mods",
+  "name": "techskillacademy-mods",
   "description": "Claude Code mods, continued from Nate Herk's claude-code-mods: cache savings, recording mode, a /goal progress bar, and a guard for parallel chats",
   "owner": {
     "name": "Paweł Jurczyk"

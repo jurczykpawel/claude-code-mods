@@ -27,26 +27,26 @@ claude plugin marketplace add jurczykpawel/claude-code-mods
 Then install the mods you want, one command each:
 
 ```bash
-claude plugin install cache-keeper@jurczykpawel-mods
+claude plugin install cache-keeper@techskillacademy-mods
 ```
 
 ```bash
-claude plugin install recording-mode@jurczykpawel-mods
+claude plugin install recording-mode@techskillacademy-mods
 ```
 
 ```bash
-claude plugin install goal-meter@jurczykpawel-mods
+claude plugin install goal-meter@techskillacademy-mods
 ```
 
 ```bash
-claude plugin install collision-guard@jurczykpawel-mods
+claude plugin install collision-guard@techskillacademy-mods
 ```
 
 Then open a new chat. A mod loads when a chat starts, and `/reload-plugins` does not reload it.
 
-**Update:** run `claude plugin marketplace update jurczykpawel-mods`, then `claude plugin update <mod>@jurczykpawel-mods`, then open a new chat. Installs are copies, so nothing changes until you update.
+**Update:** run `claude plugin marketplace update techskillacademy-mods`, then `claude plugin update <mod>@techskillacademy-mods`, then open a new chat. Installs are copies, so nothing changes until you update.
 
-**Remove:** `claude plugin uninstall <mod>@jurczykpawel-mods`.
+**Remove:** `claude plugin uninstall <mod>@techskillacademy-mods`.
 
 ## Cache Keeper
 
