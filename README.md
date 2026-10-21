@@ -1,6 +1,6 @@
 # Claude Code mods
 
-Four mods for Claude Code by Nate Herk. Mods are plugins that run inside Claude Code: they can draw on screen (a line above the prompt, a footer label, a side pane), add slash commands, and step in before Claude runs a tool. These four save money on big chats, keep private things off screen while you record, show how far along a `/goal` is, and stop two chats from editing the same file.
+Four mods for Claude Code. Mods are plugins that run inside Claude Code: they can draw on screen (a line above the prompt, a footer label, a side pane), add slash commands, and step in before Claude runs a tool. These four save money on big chats, keep private things off screen while you record, show how far along a `/goal` is, and stop two chats from editing the same file.
 
 | Mod | Commands | What it does |
 |---|---|---|
@@ -8,6 +8,8 @@ Four mods for Claude Code by Nate Herk. Mods are plugins that run inside Claude 
 | [Recording Mode](#recording-mode) | `/rec`, `/rec strict`, `/rec off`, `/rec config` | Masks keys, personal details, and business figures on screen and keeps private files closed while you record |
 | [Goal Meter](#goal-meter) | `/goals` | A progress bar for `/goal` built from Claude's own task plan, with an ETA and every chat's goal in one pane |
 | [Collision Guard](#collision-guard) | `/guard` | Asks before Claude edits a file another open chat changed in the last 30 minutes |
+
+This is a continuation of [Nate Herk's claude-code-mods](https://github.com/nateherkai/claude-code-mods) (MIT), which is no longer developed. Everything up to the first commit is his; the rest of the history is ours. Cache Keeper grew the most, and Goal Meter has a bug fix. Recording Mode and Collision Guard are still as Nate wrote them. More mods can be added to this repo, because a repo like this is a plugin marketplace with one folder per mod.
 
 ## Requirements
 
@@ -19,32 +21,32 @@ Four mods for Claude Code by Nate Herk. Mods are plugins that run inside Claude 
 Add this repo as a plugin marketplace:
 
 ```bash
-claude plugin marketplace add nateherkai/claude-code-mods
+claude plugin marketplace add jurczykpawel/claude-code-mods
 ```
 
 Then install the mods you want, one command each:
 
 ```bash
-claude plugin install cache-keeper@nateherk-mods
+claude plugin install cache-keeper@jurczykpawel-mods
 ```
 
 ```bash
-claude plugin install recording-mode@nateherk-mods
+claude plugin install recording-mode@jurczykpawel-mods
 ```
 
 ```bash
-claude plugin install goal-meter@nateherk-mods
+claude plugin install goal-meter@jurczykpawel-mods
 ```
 
 ```bash
-claude plugin install collision-guard@nateherk-mods
+claude plugin install collision-guard@jurczykpawel-mods
 ```
 
 Then open a new chat. A mod loads when a chat starts, and `/reload-plugins` does not reload it.
 
-**Update:** run `claude plugin marketplace update nateherk-mods`, then `claude plugin update <mod>@nateherk-mods`, then open a new chat. Installs are copies, so nothing changes until you update.
+**Update:** run `claude plugin marketplace update jurczykpawel-mods`, then `claude plugin update <mod>@jurczykpawel-mods`, then open a new chat. Installs are copies, so nothing changes until you update.
 
-**Remove:** `claude plugin uninstall <mod>@nateherk-mods`.
+**Remove:** `claude plugin uninstall <mod>@jurczykpawel-mods`.
 
 ## Cache Keeper
 
@@ -55,6 +57,11 @@ Every request re-reads the whole chat. From the prompt cache that costs a tenth 
 - **Cold-send guard:** if you send a message into a chat over 150k tokens after its cache expired, it asks first: Send anyway, Compact first, or Cancel.
 - **`/board`:** every local chat in one pane, with chats waiting on you first, then working ones, then the ones whose cache cools soonest. Each row shows state, context size, cache, cost, and running agents, with a keep-warm button.
 - **Handoff:** the `handoff` button (or `/handoff`) runs the bundled `/session-handoff` skill, saves the handoff, then clears the chat and sends the handoff as the fresh chat's first prompt. A short fresh chat is far cheaper than a huge one.
+- **Ledger, `/cache stats`:** what keep warm cost against what cold restarts cost, over the last 30 days, shown only when you ask. Its first line is the version this chat loaded, so you can tell a chat that started before an update.
+- **When compacting pays off, `/cache compact`:** compares the price of compacting now with the price of carrying the long context, using your own measured numbers. `/cache horizon auto|N` sets how many turns ahead it counts.
+- **Compact before keep warm ends, `/cache endcompact 200k|off`:** when keep warm is about to hit its time limit on a big chat, Cache Keeper compacts while the cache is still warm instead of letting it expire and paying for a full rewrite.
+- **Idle guard, `/cache idleguard on|off`:** Claude Code can compact a chat on its own just before the 1-hour cache expires. While keep warm is on and nobody has written for 30 minutes, the guard vetoes that, and `/cache stats` shows how many times it did.
+- **`/cache autocompact 300k|off`:** asks before the cache expires whether to compact a chat above that size. `/cache reset` puts every setting back to its default.
 - **`/cache`** shows status and settings: `ttl 5|60|auto`, `guard on|off`, `big 150k`, `alerts on|off`.
 
 Prices come from the Claude API price list. On a subscription plan they show up as usage against your limits, not a bill.

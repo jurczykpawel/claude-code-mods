@@ -1,8 +1,8 @@
 {
-  "name": "nateherk-mods",
-  "description": "Claude Code mods by Nate Herk: cache savings, recording mode, a /goal progress bar, and a guard for parallel chats",
+  "name": "jurczykpawel-mods",
+  "description": "Claude Code mods, continued from Nate Herk's claude-code-mods: cache savings, recording mode, a /goal progress bar, and a guard for parallel chats",
   "owner": {
-    "name": "Nate Herk"
+    "name": "Paweł Jurczyk"
   },
   "plugins": [
     {
