@@ -296,7 +296,7 @@ export function register(on) {
       const args = pendingGoal.args
       await startGoal($, args)
       try {
-        await $.session.append({ message: { type: 'user', content: [{ type: 'text', text: instruction(toolName) }] } })
+        await $.session.append({ message: { type: 'user', isMeta: true, content: [{ type: 'text', text: instruction(toolName) }] } })
       } catch {
         // the nudge after a few tool calls is the second chance
       }
@@ -329,7 +329,7 @@ export function register(on) {
       if (callsWithoutPlan >= NUDGE_AFTER && !nudged) {
         nudged = true
         try {
-          await $.session.append({ message: { type: 'user', content: [{ type: 'text', text: nudge(toolName) }] } })
+          await $.session.append({ message: { type: 'user', isMeta: true, content: [{ type: 'text', text: nudge(toolName) }] } })
         } catch {
           // the band says the plan is missing either way
         }
