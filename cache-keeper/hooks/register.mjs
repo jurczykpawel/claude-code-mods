@@ -14,6 +14,7 @@ import { makeMasker } from './privacy.mjs'
 import { pingMarginMs, classifyColdRestart, settleKeepWarm, summarize, pruneEvents } from './ledger.mjs'
 import { VERSION } from './version.mjs'
 import { endCompactDue } from './endcompact.mjs'
+import { slideUntil } from './keepwarmwindow.mjs'
 import { shouldBlockCompact, summarizeIdleBlocks, vetoResult, blockOverridden } from './idleguard.mjs'
 import { DEFAULT_PARAMS, advise, calibrate, gapShare, stepsPerTurn, horizonFrom, adviceSummary } from './compact.mjs'
 
@@ -57,6 +58,7 @@ const S = {
   lastTurnEnd: 0,
   keepWarm: false,
   keepWarmUntil: 0,
+  keepWarmSpan: 0, // hours the limit is restarted to on each real message
   pings: 0,
   pingUsd: 0,
   lastPingAt: 0,
@@ -372,6 +374,7 @@ async function applyRemoteCommands($) {
 
 function startKeepWarm($, hours) {
   S.keepWarm = true
+  S.keepWarmSpan = hours
   S.keepWarmUntil = now + hours * 60 * MIN
   $.ui.toast(`Keeping this cache warm until ${clock(S.keepWarmUntil)}. A ping reads the cache before it expires.`)
 }
@@ -749,7 +752,7 @@ export function register(on) {
     const saved = await $.store.get('ledger:' + S.id)
     S.events = Array.isArray(saved) ? saved : []
     names.cache = (await registerCommand($, 'cache', 'Cache Keeper status and settings', '[ttl 5|60|auto] [guard on|off] [big 150k] [alerts on|off] [autocompact 300k|off] [reset] [stats] [compact] [horizon 15]')) || names.cache
-    names.keepwarm = (await registerCommand($, 'keepwarm', 'Keep this session\'s prompt cache warm (default 12 hours), or /keepwarm off', '[hours|off]', true)) || names.keepwarm
+    names.keepwarm = (await registerCommand($, 'keepwarm', 'Keep this session\'s prompt cache warm (default 12 hours; each message restarts the clock), or /keepwarm off', '[hours|off]', true)) || names.keepwarm
     names.board = (await registerCommand($, 'board', 'Every local Claude Code session: state, context, cache, cost', '', true)) || names.board
     names.handoff = (await registerCommand($, 'handoff', 'Session handoff, then clear this chat and continue with it (/handoff continue)', '[continue]')) || names.handoff
     $.clock.every(HEARTBEAT_EVERY, () => tick($).catch(() => {}))
@@ -834,6 +837,7 @@ export function register(on) {
     S.working = true
     if (!e.agentId) {
       S.turns += 1
+      S.keepWarmUntil = slideUntil({ keepWarmOn: S.keepWarm, spanHours: S.keepWarmSpan, now, until: S.keepWarmUntil })
       if (S.lastRealAt && now - S.lastRealAt > ttlMin() * MIN) S.longGaps += 1
     }
     if (e.turnId) S.turnId = e.turnId
