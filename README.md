@@ -64,6 +64,14 @@ Every request re-reads the whole chat. From the prompt cache that costs a tenth 
 - **`/cache autocompact 300k|off`:** asks before the cache expires whether to compact a chat above that size. `/cache reset` puts every setting back to its default.
 - **`/cache`** shows status and settings: `ttl 5|60|auto`, `guard on|off`, `big 150k`, `alerts on|off`.
 
+For unattended agent sessions, set these variables in the session's environment before starting Claude Code:
+
+```bash
+CACHE_KEEPER_KEEPWARM_HOURS=24 CACHE_KEEPER_GUARD=off claude
+```
+
+`CACHE_KEEPER_KEEPWARM_HOURS` starts keep warm automatically for 1–72 hours, including on resume, clear, and fork. Every real message restarts that window; `/keepwarm off` stops it for the rest of that session. Missing or invalid values leave keep warm off. `CACHE_KEEPER_GUARD=off` sends cold messages without the cold-send dialog in this session only; other values use the saved guard setting. Neither variable changes saved settings. Manual `/keepwarm` still has its 24-hour maximum.
+
 Prices come from the Claude API price list. On a subscription plan they show up as usage against your limits, not a bill.
 
 ## Recording Mode

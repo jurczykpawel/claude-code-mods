@@ -73,6 +73,7 @@ const names = { cache: 'cache', keepwarm: 'keepwarm', board: 'board', handoff: '
 
 let now = 0
 let home = ''
+let guardOff = false
 let lastHeartbeat = 0
 let rec = { on: false, strict: false }
 let mask = (s) => s
@@ -707,6 +708,13 @@ async function tick($) {
   $.ui.invalidate('ui.render')
 }
 
+async function startFromEnvironment($) {
+  guardOff = (await $.env.get('CACHE_KEEPER_GUARD')) === 'off'
+  const value = await $.env.get('CACHE_KEEPER_KEEPWARM_HOURS')
+  const hours = typeof value === 'string' && /^\d+(?:\.\d+)?$/.test(value) ? Number(value) : 0
+  if (hours >= 1 && hours <= 72) startKeepWarm($, hours)
+}
+
 async function loadSettings($) {
   const saved = await $.store.get('settings')
   if (saved && typeof saved === 'object') Object.assign(settings, saved)
@@ -725,7 +733,7 @@ function statusText() {
   lines.push(`Session cost so far: ${money(S.costUsd)}. Cold restarts this session: ${S.coldRestarts.length} (${money(S.coldRestarts.reduce((a, c) => a + c.usd, 0))}).`)
   const led = summarize(S.events)
   lines.push(`Ledger, this chat: keep warm net ${money(led.keepWarm.netUsd)} (spent ${money(led.keepWarm.pingUsd)}, saved ${money(led.keepWarm.savedUsd)}); cold restarts ${money(led.cold.usd)}, of which avoidable ${money(led.cold.avoidableUsd)}. Details: /${names.cache} stats.`)
-  lines.push(`Cold-send guard: ${settings.guard ? 'on' : 'off'} for contexts over ${tokens(settings.bigTokens)} tokens. Alerts: ${settings.alerts ? 'on' : 'off'}.`)
+  lines.push(`Cold-send guard: ${settings.guard && !guardOff ? 'on' : 'off'} for contexts over ${tokens(settings.bigTokens)} tokens. Alerts: ${settings.alerts ? 'on' : 'off'}.`)
   lines.push(`Idle-compaction guard: ${settings.idleGuard ? 'on (blocks Claude Code\'s own idle compaction while keep warm is on)' : 'off'}. /cache idleguard on|off.`)
   lines.push(`Compact before keep warm ends: ${settings.endCompactTokens ? `on for contexts over ${tokens(settings.endCompactTokens)} tokens, when nobody wrote for 30 min and the last ping is due` : 'off'}. /cache endcompact 200k|off.`)
   lines.push(`Auto-compact: ${settings.autoCompactTokens ? `asks near the end of the cache window on contexts over ${tokens(settings.autoCompactTokens)} tokens` : 'off'}.`)
@@ -748,6 +756,7 @@ export function register(on) {
     S.label = basename(S.cwd)
     S.model = await $.session.model()
     await loadSettings($)
+    await startFromEnvironment($)
     await readRecording($)
     const saved = await $.store.get('ledger:' + S.id)
     S.events = Array.isArray(saved) ? saved : []
@@ -771,6 +780,7 @@ export function register(on) {
     S.longestSleepMs = 0
     S.pendingResume = e.source === 'resume'
     S.keepWarm = false
+    await startFromEnvironment($)
     H.armed = false
     try {
       S.id = (await $.session.id()) || S.id
@@ -807,7 +817,7 @@ export function register(on) {
     const left = msLeft(S.lastActivity, ttl)
     const isCold = left !== null && left <= 0
     const fromUser = e.origin && (e.origin.kind === 'composer' || e.origin.kind === 'bridge')
-    if (!settings.guard || !fromUser || !isCold || S.ctx < settings.bigTokens || e.turnId) return next(e)
+    if (guardOff || !settings.guard || !fromUser || !isCold || S.ctx < settings.bigTokens || e.turnId) return next(e)
     const cost = money(rewriteCost(S.ctx, S.model, ttl))
     let answer = 'Send anyway'
     try {
