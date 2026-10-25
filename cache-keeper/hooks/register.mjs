@@ -11,10 +11,10 @@
 import { rewriteCost, requestCost, totalInput, cachedShare, priceFor } from './pricing.mjs'
 import { tokens, usd, minutes, clock, clip, basename, pad } from './fmt.mjs'
 import { makeMasker } from './privacy.mjs'
-import { pingMarginMs, classifyColdRestart, settleKeepWarm, summarize, pruneEvents } from './ledger.mjs'
+import { classifyColdRestart, settleKeepWarm, summarize, pruneEvents } from './ledger.mjs'
 import { VERSION } from './version.mjs'
 import { endCompactDue } from './endcompact.mjs'
-import { slideUntil } from './keepwarmwindow.mjs'
+import { slideUntil, pingDue } from './keepwarmwindow.mjs'
 import { shouldBlockCompact, summarizeIdleBlocks, vetoResult, blockOverridden } from './idleguard.mjs'
 import { DEFAULT_PARAMS, advise, calibrate, gapShare, stepsPerTurn, horizonFrom, adviceSummary } from './compact.mjs'
 
@@ -77,6 +77,7 @@ let guardOff = false
 let lastHeartbeat = 0
 let rec = { on: false, strict: false }
 let mask = (s) => s
+let requestOut = false // a main-loop model request is in flight; a turn that only waits has none
 let fleet = [] // heartbeats of every session, this one included
 const alerted = new Map() // sessionId -> state or warning key already announced
 let paneOpen = false
@@ -423,9 +424,8 @@ async function keepWarmStep($) {
     if (await compactInsteadOfLastPing($)) return
     return stopKeepWarm($, 'time limit reached')
   }
-  if (S.working || !S.lastActivity) return
   const ttl = ttlMin()
-  if (now - S.lastActivity < ttl * MIN - pingMarginMs(ttl)) return
+  if (!pingDue({ requestOut, lastActivity: S.lastActivity, now, ttlMin: ttl })) return
   if (await compactInsteadOfLastPing($)) return
   let reply = null
   try {
@@ -433,6 +433,8 @@ async function keepWarmStep($) {
   } catch {
     reply = null
   }
+  // Mid-turn the fork may have nothing to share yet: try again on the next tick
+  if (S.working && (!reply || reply.reason === 'nothing-to-fork' || reply.reason === 'aborted')) return
   if (!reply || !reply.usage) {
     return stopKeepWarm($, 'the ping got no answer, so the cache may already be cold')
   }
@@ -858,7 +860,13 @@ export function register(on) {
   // Each main-loop request: did it read the cache, or rewrite it?
   on('turn.step', async function* ($, e, next) {
     const startedAt = await $.clock.now()
-    const result = yield* next(e)
+    if (!e.agentId) requestOut = true
+    let result
+    try {
+      result = yield* next(e)
+    } finally {
+      if (!e.agentId) requestOut = false
+    }
     if (e.agentId || !result || !result.usage) return result
     now = await $.clock.now()
     S.steps += 1

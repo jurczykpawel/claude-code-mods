@@ -18,3 +18,18 @@ test('keep warm off or no span: unchanged', () => {
   assert.equal(slideUntil({ keepWarmOn: false, spanHours: 24, now: T0, until: 5 }), 5)
   assert.equal(slideUntil({ keepWarmOn: true, spanHours: 0, now: T0, until: 5 }), 5)
 })
+
+import { pingDue } from '../hooks/keepwarmwindow.mjs'
+
+const MIN = 60000
+const due = (o) => pingDue({ requestOut: false, lastActivity: T0, now: T0 + 55 * MIN, ttlMin: 60, ...o })
+
+test('ping is due while the turn waits for an answer or a long command (no request out)', () => {
+  assert.equal(due({}), true)
+})
+
+test('no ping while a model request is out, before the margin, or with no request yet', () => {
+  assert.equal(due({ requestOut: true }), false)
+  assert.equal(due({ now: T0 + 30 * MIN }), false)
+  assert.equal(due({ lastActivity: 0 }), false)
+})
